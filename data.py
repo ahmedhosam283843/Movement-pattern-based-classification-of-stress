@@ -1,3 +1,10 @@
+"""
+Data loading, merging, labels, integrity checks.
+References:
+- Wang et al. (2024, Gait & Posture): time+frequency features, waist/hands/legs emphasis.
+- Shin et al. (2021, SAC): attention & movement patterns.
+"""
+
 from typing import Dict, Tuple
 import pandas as pd
 import numpy as np
@@ -81,3 +88,36 @@ def integrity_checks(df: pd.DataFrame, angle_name_hints: Tuple[str,...] = ('angl
     print(cps.head(10))
 
     return report
+
+def add_cortisol_labels(merged_df, cortisol_map):
+    """
+    cortisol_map: dict like {"02":1, ...}
+    """
+    merged_df = merged_df.copy()
+    merged_df['cortisol'] = merged_df.index.get_level_values('participant').str.replace('VP_', '').map(
+        lambda x: cortisol_map.get(x, 0)
+    )
+    return merged_df
+
+def join_stride_times(idx_df: pd.DataFrame, stride_times: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robust per-cycle stride_time join:
+      - Accepts stride_times with either stride_idx or cycle_idx; normalizes to cycle_idx.
+      - Works with flat DataFrame or MultiIndex stride_times (resets if needed).
+      - Validates many-to-one merge on (participant, condition, bout, speed, cycle_idx).
+    """
+    st = stride_times.copy()
+    # normalize index and column names
+    if isinstance(st.index, pd.MultiIndex):
+        st = st.reset_index()
+    if 'stride_idx' in st.columns and 'cycle_idx' not in st.columns:
+        st = st.rename(columns={'stride_idx': 'cycle_idx'})
+
+    required = ['participant','condition','bout','speed','cycle_idx','stride_time']
+    missing = set(required) - set(st.columns)
+    if missing:
+        raise ValueError(f"stride_times missing columns: {missing}")
+
+    common = ['participant','condition','bout','speed','cycle_idx']
+    merged = idx_df.merge(st[common + ['stride_time']], on=common, how='left', validate='many_to_one')
+    return merged
