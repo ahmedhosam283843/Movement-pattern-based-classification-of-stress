@@ -153,3 +153,92 @@ def build_sequences_subjectwise(
     )
     return X, y, idx_cycles, feature_names
 
+def add_balance_augmentation(X, y, idx_df, feat_names, train_participants, minority_label=1, target_coverage=1.0, rng=None):
+    """
+    Compute per-fold augmentation to roughly balance classes (train participants only).
+    Returns augmented (X, y, idx_df).
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    mask_train = idx_df["participant"].isin(train_participants).to_numpy()
+    y_tr = y[mask_train]
+    n_pos = int((y_tr == minority_label).sum())
+    n_neg = int((y_tr != minority_label).sum())
+    if n_pos == 0 or n_neg == 0:
+        return X, y, idx_df  # nothing to do
+    need = int(max(0, n_neg - n_pos) * target_coverage)
+    if need <= 0:
+        return X, y, idx_df
+
+    # choose minority cycles to augment
+    sel = np.where(mask_train & (y == minority_label))[0]
+    chosen = rng.choice(sel, size=need, replace=True)
+
+    # reuse your existing augmentation ops
+    X_aug_list, y_aug_list, idx_aug_list = [], [], []
+    mask = np.ones(X.shape[2], dtype=bool)
+    for special in ["is_fast","stride_time"]:
+        if special in feat_names:
+            mask[feat_names.index(special)] = False
+
+    for i in chosen:
+        # compose light augmentations
+        aug = X[i].copy()
+        # small jitter
+        aug += rng.normal(0.0, 0.01, size=aug.shape).astype(np.float32) * mask
+        # small scaling
+        alpha = rng.uniform(0.97, 1.03)
+        aug[:, mask] = (aug[:, mask] * alpha).astype(np.float32)
+        # tiny phase shift
+        if rng.random() < 0.5:
+            k = rng.integers(-2, 3)
+            aug = np.roll(aug, shift=k, axis=0)
+
+        meta = idx_df.iloc[i].to_dict()
+        X_aug_list.append(aug)
+        y_aug_list.append(int(y[i]))
+        idx_aug_list.append(meta)
+
+    if not X_aug_list:
+        return X, y, idx_df
+    X_aug = np.stack(X_aug_list, axis=0)
+    y_aug = np.array(y_aug_list, dtype=np.int64)
+    idx_aug = pd.DataFrame(idx_aug_list)
+    X_out = np.concatenate([X, X_aug], axis=0)
+    y_out = np.concatenate([y, y_aug], axis=0)
+    idx_out = pd.concat([idx_df, idx_aug], axis=0, ignore_index=True)
+    return X_out, y_out, idx_out
+
+def augment_jitter(cycle, sigma=0.01, channels_mask=None, rng=None):
+    """
+    Add small Gaussian noise to selected channels.
+    cycle: (T,F)
+    channels_mask: boolean array (F,) marking channels to perturb (e.g., angles/vels, not is_fast).
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    noise = rng.normal(0.0, sigma, size=cycle.shape)
+    if channels_mask is None:
+        return cycle + noise.astype(np.float32)
+    noise[:, ~channels_mask] = 0.0
+    return (cycle + noise).astype(np.float32)
+
+def augment_magnitude_scale(cycle, low=0.95, high=1.05, channels_mask=None, rng=None):
+    """
+    Scale magnitude globally for selected channels.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    alpha = rng.uniform(low, high)
+    scaled = cycle.copy()
+    if channels_mask is None:
+        scaled = scaled * alpha
+    else:
+        scaled[:, channels_mask] = scaled[:, channels_mask] * alpha
+    return scaled.astype(np.float32)
+
+def augment_phase_shift(cycle, max_shift=3, rng=None):
+    """
+    Circularly shift time by up to max_shift samples (re-phase within stride).
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    T = cycle.shape[0]
+    k = rng.integers(-max_shift, max_shift+1)
+    return np.roll(cycle, shift=k, axis=0).astype(np.float32)
