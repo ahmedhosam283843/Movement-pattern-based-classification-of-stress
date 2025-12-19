@@ -250,3 +250,230 @@ def wavelet_features(signal, wavelet='db4', level=5):
             out[f"{name}_power"]  = float(np.sum(c**2))
     return out
 
+def compute_cycle_features(X, idx_df_with_st, feat_names):
+    """
+    Per-cycle feature computation aligned with the literature:
+      - Freezing/stillness at multiple thresholds (Richer et al., 2024).
+      - Time–frequency features on velocities/angles (Wang et al., 2024: dominant freq, 0–5 Hz bandpower,
+        spectral centroid, spectral entropy; plus 0–1 Hz bandpower and ratios).
+      - Coordination (corr) and phase-lag (Chen & Lee, 2024).
+      - Segment aggregates (waist/hands/legs emphasis).
+    """
+    ch_idx, is_fast_idx, stride_time_idx = build_channel_index(feat_names, JOINTS)
+
+    rows, keys = [], []
+    for i in range(X.shape[0]):
+        pid   = idx_df_with_st.loc[i, "participant"]
+        cond  = idx_df_with_st.loc[i, "condition"]
+        bout  = idx_df_with_st.loc[i, "bout"]
+        speed = idx_df_with_st.loc[i, "speed"]
+        cidx  = int(idx_df_with_st.loc[i, "cycle_idx"])
+        stime = idx_df_with_st.loc[i, "stride_time"]
+        dt    = safe_dt(stime)
+        fs    = 1.0 / dt
+
+        cycle = X[i]  # (T, F)
+        vel_series = {j: cycle[:, ch_idx["vel"][j]]   for j in JOINTS}
+        ang_series = {j: cycle[:, ch_idx["angle"][j]] for j in JOINTS}
+        acc_series = {j: cycle[:, ch_idx["acc"][j]]   for j in JOINTS}
+
+        feat = {}
+        # per-joint features
+        for j in JOINTS:
+            v = vel_series[j]
+            a = ang_series[j]
+            acc = acc_series[j]
+
+            # time-domain
+            feat[f"{j}_motion_energy"] = float(np.sum(v**2) * dt)
+            feat[f"{j}_vel_rms"] = float(np.sqrt(np.mean(v**2)))
+
+            # freezing/stillness (multi-threshold; Richer 2024)
+            multi_freeze = freezing_stats_multi(v, dt, eps_factors=(0.05, 0.10, 0.20))
+            # keep the 0.10 series as canonical + include all thresholds
+            feat[f"{j}_frac_still"] = multi_freeze["frac_still_e010"]
+            feat[f"{j}_longest_still_sec"] = multi_freeze["longest_still_sec_e010"]
+            feat[f"{j}_n_still_bouts"] = multi_freeze["n_still_bouts_e010"]
+            for kf, val in multi_freeze.items():
+                feat[f"{j}_{kf}"] = val
+
+            feat[f"{j}_rom"]  = float(np.ptp(a))
+            feat[f"{j}_mean"] = float(np.mean(a))
+            feat[f"{j}_std"]  = float(np.std(a))
+
+            # phase timing of extrema
+            T = len(a) - 1 if len(a) > 1 else 1
+            feat[f"{j}_tmax_phase"] = int(np.argmax(a)) / T
+            feat[f"{j}_tmin_phase"] = int(np.argmin(a)) / T
+
+            # velocity spectrum (Wang 2024)
+            dom, bp05, cen, ent = welch_features(v, fs)
+            feat[f"{j}_dom_freq"]      = dom
+            feat[f"{j}_bandpower_0_5"] = bp05
+            feat[f"{j}_spec_centroid"]  = cen
+            feat[f"{j}_spec_entropy"]   = ent
+            bp01_v = welch_bandpower(v, fs, 0.0, 1.0)
+            feat[f"{j}_bandpower_0_1"] = bp01_v
+            feat[f"{j}_bp_ratio_01_05"] = (bp01_v / (bp05 + 1e-12)) if np.isfinite(bp05) else np.nan
+
+            # angle spectrum (same set)
+            dom_a, bp05_a, cen_a, ent_a = welch_features(a, fs)
+            feat[f"{j}_angle_dom_freq"]       = dom_a
+            feat[f"{j}_angle_bandpower_0_5"]  = bp05_a
+            bp01_a = welch_bandpower(a, fs, 0.0, 1.0)
+            feat[f"{j}_angle_bandpower_0_1"]  = bp01_a
+            feat[f"{j}_angle_bp_ratio_01_05"] = (bp01_a / (bp05_a + 1e-12)) if np.isfinite(bp05_a) else np.nan
+
+            # acceleration vigor
+            feat[f"{j}_acc_rms"] = float(np.sqrt(np.mean(acc**2)))
+
+        # segment indices
+        legs   = ["hip_flexion", "knee_flexion"]
+        hands  = ["shoulder_angle", "elbow_angle", "arm_swing"]
+        waist  = ["hip_flexion"]  # proxy
+
+        # Build segment velocity signals by averaging joints within a segment
+        def segment_vel_avg(joints):
+            arr = [vel_series[j] for j in joints if j in vel_series]
+            return np.mean(np.vstack(arr), axis=0) if arr else None
+
+        seg_vel = {
+            "legs":  segment_vel_avg(legs),
+            "hands": segment_vel_avg(hands),
+            "waist": segment_vel_avg(waist),
+        }
+
+        # Wavelet features per segment
+        for seg_name, vseg in seg_vel.items():
+            if vseg is None: 
+                continue
+            wv = wavelet_features(vseg, wavelet='db4', level=5)
+            # Keep a compact set (absmax, std, power) from D2..D5 + A5
+            for k, val in wv.items():
+                if any(s in k for s in ["D2","D3","D4","D5","A5"]) and any(m in k for m in ["absmax","std","power"]):
+                    feat[f"seg_{seg_name}_wave_{k}"] = val
+
+
+        # coordination (corr + phase-lag)
+        for a, b in COORD_PAIRS:
+            corr = compute_coord_corr(vel_series, (a, b))
+            lag, lag_phase = compute_phase_lag(vel_series[a], vel_series[b])
+            feat[f"corr_vel_{a}_{b}"] = corr
+            feat[f"phase_lag_samples_{a}_{b}"] = lag
+            feat[f"phase_lag_phase_{a}_{b}"] = lag_phase
+
+        # segment aggregates (waist/hands/legs)
+        legs   = ["hip_flexion", "knee_flexion"]
+        hands  = ["shoulder_angle", "elbow_angle", "arm_swing"]
+        waist  = ["hip_flexion"]  # waist proxy
+
+        for m in ["rom", "frac_still", "motion_energy", "vel_rms", "bandpower_0_5"]:
+            vals = {j: feat.get(f"{j}_{m}", np.nan) for j in JOINTS}
+            feat[f"seg_legs_{m}"]  = segment_aggregate(vals, legs)
+            feat[f"seg_hands_{m}"] = segment_aggregate(vals, hands)
+            feat[f"seg_waist_{m}"] = segment_aggregate(vals, waist)
+
+        for m in ["bp_ratio_01_05", "angle_bp_ratio_01_05"]:
+            vals = {j: feat.get(f"{j}_{m}", np.nan) for j in JOINTS}
+            feat[f"seg_legs_{m}"]  = segment_aggregate(vals, legs)
+            feat[f"seg_hands_{m}"] = segment_aggregate(vals, hands)
+            feat[f"seg_waist_{m}"] = segment_aggregate(vals, waist)
+
+        feat["is_fast"] = float(cycle[0, is_fast_idx])
+        feat["stride_time"] = float(stime) if (stime is not None and np.isfinite(stime)) else np.nan
+
+        rows.append(feat)
+        keys.append((pid, cond, bout, speed, cidx))
+
+    cy_df = pd.DataFrame(rows)
+    cy_idx = pd.MultiIndex.from_tuples(keys, names=["participant","condition","bout","speed","cycle_idx"])
+    cy_df.index = cy_idx
+    return cy_df
+
+def add_stride_time_aggregates(cycle_features: pd.DataFrame, stride_times: pd.DataFrame) -> pd.DataFrame:
+    """
+    Safely attach stride-time aggregates (mean, std, CV, bout asymmetry) and cross-speed deltas
+    to cycle_features without MultiIndex join issues.
+    """
+    st = stride_times.copy()
+    if isinstance(st.index, pd.MultiIndex):
+        st = st.reset_index()
+    if 'stride_idx' in st.columns and 'cycle_idx' not in st.columns:
+        st = st.rename(columns={'stride_idx': 'cycle_idx'})
+
+    req = {'participant','condition','bout','speed','cycle_idx','stride_time'}
+    if not req.issubset(st.columns):
+        raise ValueError(f"stride_times must contain {req}")
+
+    # per participant × speed aggregates
+    agg_ps = (
+        st.groupby(['participant','speed'])['stride_time']
+          .agg(st_mean='mean', st_std='std', st_min='min', st_max='max')
+          .reset_index()
+    )
+    agg_ps['st_cv'] = agg_ps['st_std'] / (agg_ps['st_mean'] + 1e-12)
+
+    # bout asymmetry (% diff) if two bouts exist
+    pb = st.groupby(['participant','speed','bout'])['stride_time'].mean().reset_index()
+    pv = pb.pivot(index=['participant','speed'], columns='bout', values='stride_time').reset_index()
+
+    def _asym(row):
+        vals = row.drop(labels=['participant','speed']).dropna().values
+        if len(vals) >= 2:
+            return (np.abs(vals[0] - vals[1]) / (np.mean(vals) + 1e-12)) * 100.0
+        return np.nan
+
+    pv['st_bout_asym_pct'] = pv.apply(_asym, axis=1)
+    pv = pv[['participant','speed','st_bout_asym_pct']]
+
+    # cross-speed deltas per participant
+    base = st.groupby(['participant','speed'])['stride_time'].agg(mean='mean', std='std').reset_index()
+    base['cv'] = base['std'] / (base['mean'] + 1e-12)
+    b_piv = base.pivot(index='participant', columns='speed', values=['mean','cv'])
+    b_piv.columns = ['_'.join(col).strip() for col in b_piv.columns.to_flat_index()]
+
+    delta_df = b_piv.copy()
+    delta_df['st_delta_mean_fast_minus_slow'] = (
+        delta_df.get('mean_fast', np.nan) - delta_df.get('mean_slow', np.nan)
+    )
+    delta_df['st_delta_cv_fast_minus_slow'] = (
+        delta_df.get('cv_fast', np.nan) - delta_df.get('cv_slow', np.nan)
+    )
+    delta_df = delta_df[['st_delta_mean_fast_minus_slow','st_delta_cv_fast_minus_slow']].reset_index()
+
+    # merge into cycle_features
+    cf = cycle_features.reset_index()
+    cf = cf.merge(agg_ps, on=['participant','speed'], how='left')
+    cf = cf.merge(pv, on=['participant','speed'], how='left')
+    cf = cf.merge(delta_df, on='participant', how='left')
+    cf = cf.set_index(['participant','condition','bout','speed','cycle_idx']).sort_index()
+    return cf
+
+def aggregate_participant_features(cycle_features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Participant × speed aggregates: mean, std, IQR + selected deltas (fast−slow) for segment features.
+    Produces consistently flattened column names: <feature>_<agg> (e.g., seg_waist_frac_still_mean).
+    """
+    def iqr(x):
+        q75, q25 = np.nanpercentile(x, 75), np.nanpercentile(x, 25)
+        return q75 - q25
+
+    cols_to_agg = [c for c in cycle_features.columns if c not in ["is_fast"]]
+    grouped = cycle_features.groupby(["participant","speed"])
+    agg_df = grouped[cols_to_agg].agg(["mean","std",iqr])
+
+    # flatten MultiIndex columns
+    agg_df.columns = [f"{c}_{agg}" for c, agg in agg_df.columns]
+    agg_df["n_cycles"] = grouped.size()
+
+    # slow-fast deltas for key segment features
+    speed_pv = agg_df.reset_index().pivot(index="participant", columns="speed")
+    speed_pv.columns = [f"{a}_{b}" for a,b in speed_pv.columns]
+    seg_feats = ["seg_waist_frac_still_mean","seg_hands_bandpower_0_5_mean","seg_legs_rom_mean"]
+
+    delta_part = pd.DataFrame(index=speed_pv.index)
+    for f in seg_feats:
+        delta_part[f"delta_{f}_fast_minus_slow"] = speed_pv.get(f+"_fast", np.nan) - speed_pv.get(f+"_slow", np.nan)
+
+    part_df = agg_df.reset_index().merge(delta_part.reset_index(), on="participant", how="left")
+    return part_df
