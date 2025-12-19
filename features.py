@@ -193,30 +193,60 @@ def welch_features(signal, fs):
     entropy = -np.sum(p * np.log(p + 1e-12))
     return dom_freq, bandpower, centroid, entropy
 
+def timing_of_extrema(series):
     """
-    Participant × speed aggregates: mean, std, IQR + selected deltas (fast−slow) for segment features.
-    Produces consistently flattened column names: <feature>_<agg> (e.g., seg_waist_frac_still_mean).
+    Phase timing (0..1) of max and min angle within stride (Wang 2024-like).
     """
-    def iqr(x):
-        q75, q25 = np.nanpercentile(x, 75), np.nanpercentile(x, 25)
-        return q75 - q25
+    T = len(series)
+    idx_max = int(np.argmax(series))
+    idx_min = int(np.argmin(series))
+    return idx_max / (T - 1), idx_min / (T - 1)
 
-    cols_to_agg = [c for c in cycle_features.columns if c not in ["is_fast"]]
-    grouped = cycle_features.groupby(["participant","speed"])
-    agg_df = grouped[cols_to_agg].agg(["mean","std",iqr])
+def rom(series):
+    """
+    Range of motion (max - min) of a series.
+    """
+    return np.ptp(series)
 
-    # flatten MultiIndex columns
-    agg_df.columns = [f"{c}_{agg}" for c, agg in agg_df.columns]
-    agg_df["n_cycles"] = grouped.size()
+def segment_aggregate(values_dict, joints):
+    arr = np.array([values_dict[j] for j in joints if j in values_dict and np.isfinite(values_dict[j])])
+    if arr.size == 0:
+        return np.nan
+    return float(np.nanmean(arr))
 
-    # slow-fast deltas for key segment features
-    speed_pv = agg_df.reset_index().pivot(index="participant", columns="speed")
-    speed_pv.columns = [f"{a}_{b}" for a,b in speed_pv.columns]
-    seg_feats = ["seg_waist_frac_still_mean","seg_hands_bandpower_0_5_mean","seg_legs_rom_mean"]
+def compute_coord_corr(vel_dict, pair):
+    a = vel_dict.get(pair[0], None)
+    b = vel_dict.get(pair[1], None)
+    if a is None or b is None:
+        return np.nan
+    if np.std(a) == 0 or np.std(b) == 0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0,1])
 
-    delta_part = pd.DataFrame(index=speed_pv.index)
-    for f in seg_feats:
-        delta_part[f"delta_{f}_fast_minus_slow"] = speed_pv.get(f+"_fast", np.nan) - speed_pv.get(f+"_slow", np.nan)
+def wavelet_features(signal, wavelet='db4', level=5):
+    """
+    Wang 2024-style wavelet features:
+      Decompose into D1..D5 and A5; compute abs max, mean, std, and absolute power for each.
+    Returns dict {D1_absmax, D1_mean, D1_std, D1_power, ..., A5_power}
+    """
+    # detrend
+    x = signal - np.mean(signal)
+    try:
+        coeffs = pywt.wavedec(x, wavelet, level=level, mode='symmetric')
+    except Exception:
+        return {}
+    names = [f"D{i}" for i in range(1, level+1)][::-1] + [f"A{level}"]  # D1..D5, A5
+    out = {}
+    for name, c in zip(names, coeffs):
+        if c is None or len(c) == 0:
+            out[f"{name}_absmax"] = np.nan
+            out[f"{name}_mean"] = np.nan
+            out[f"{name}_std"] = np.nan
+            out[f"{name}_power"] = np.nan
+        else:
+            out[f"{name}_absmax"] = float(np.max(np.abs(c)))
+            out[f"{name}_mean"]   = float(np.mean(c))
+            out[f"{name}_std"]    = float(np.std(c))
+            out[f"{name}_power"]  = float(np.sum(c**2))
+    return out
 
-    part_df = agg_df.reset_index().merge(delta_part.reset_index(), on="participant", how="left")
-    return part_df
