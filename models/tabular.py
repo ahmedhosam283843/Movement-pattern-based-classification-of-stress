@@ -20,6 +20,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score, balanced_accuracy_score, f1_score, precision_score, recall_score
 from xgboost import XGBClassifier
+from validation import tune_threshold_balacc, bootstrap_metric # <-- Import updated
 logo = LeaveOneGroupOut()
 imputer = SimpleImputer(strategy='median')
 rng = np.random.default_rng(42)
@@ -137,130 +138,196 @@ def run_lopo_logistic_combined(X, y, groups, k_features=40, C=0.5, verbose=True,
     return probs, y_true, y_pred, np.array(part_te)
 
 
-
+def run_lopo_rf_combined(X, y, groups, n_estimators=300, min_leaf=3, k_features=40, verbose=True):
     """
-    LOPO XGBoost on Top-20 slow features:
-      - fold-wise top-k selection from training participants only (mutual info),
-      - early stopping on AUPRC (imbalance-aware),
-      - validation-based threshold tuning (balanced accuracy),
-      - aggregates and saves mean feature importances across folds.
-    Returns metrics dict and mean-importance DataFrame.
+    FIXED: This function now correctly performs per-fold threshold tuning to avoid data leakage.
+    For each outer fold (leaving one participant out), it creates an inner validation split
+    from the training data to find an optimal decision threshold. This threshold is then
+    applied only to the held-out test participant for that fold.
     """
-    # Build slow-only matrix
-    cols = [c for c in wide_df.columns if c not in ('participant', 'label')]
-    slow_cols = [c for c in cols if c.endswith('_slow')]
-    X = wide_df[slow_cols].values
-    y = wide_df['label'].values
-    groups = wide_df['participant'].values
-    feat_names = slow_cols
-
+    pipe = Pipeline([
+        ('impute', SimpleImputer(strategy='median')),
+        ('scale', StandardScaler(with_mean=False)),
+        ('select', SelectKBest(f_classif, k=k_features)),
+        ('clf', RandomForestClassifier(
+            n_estimators=n_estimators, max_features='sqrt',
+            min_samples_leaf=min_leaf, class_weight='balanced_subsample',
+            random_state=42, n_jobs=1))
+    ])
     probs_te, y_te, yhat_te, parts_te = [], [], [], [] # <-- ADDED parts_te
-    fold_imp_dfs = []
+    pbar = tqdm(total=len(np.unique(groups)),
+                desc="LOPO RF (combined)", leave=True) if verbose else None
 
-    rng = np.random.default_rng(random_state)
-    pbar = tqdm(total=len(np.unique(groups)), desc="XGB Top-20 (slow) LOPO", leave=True) if verbose else None
-
-    # Lightweight, regularized parameter candidates
-    param_candidates = [
-        dict(n_estimators=600, max_depth=2, learning_rate=0.05, subsample=0.9, colsample_bytree=0.9,
-             min_child_weight=5, gamma=1.0, reg_lambda=5.0, reg_alpha=0.5),
-        dict(n_estimators=800, max_depth=2, learning_rate=0.03, subsample=0.8, colsample_bytree=0.8,
-             min_child_weight=5, gamma=0.5, reg_lambda=4.0, reg_alpha=0.3),
-        dict(n_estimators=500, max_depth=3, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
-             min_child_weight=3, gamma=0.0, reg_lambda=1.0, reg_alpha=0.0),
-    ]
-
-    for fold, (tr, te) in enumerate(logo.split(X, y, groups), 1):
+    for tr, te in logo.split(X, y, groups):
+        # Create a stable inner validation split from this fold's training data
         grp_tr = groups[tr]
         train_parts = np.unique(grp_tr).tolist()
-        val_count = max(1, int(0.2 * len(train_parts)))
-        val_parts = rng.choice(train_parts, size=val_count, replace=False).tolist()
+        rng = np.random.default_rng(
+            42 + len(train_parts))  # Reproducible split
+        val_count = max(1, int(0.2 * len(train_parts)))  # 20% for validation
+        val_parts = rng.choice(
+            train_parts, size=val_count, replace=False).tolist()
+
         mask_val = np.isin(grp_tr, val_parts)
         mask_core = ~mask_val
 
-        # Fold-wise Top-k on training participants only
-        topk_idx = _topk_by_mutual_info(X[tr][mask_core], y[tr][mask_core], k=min(k, X.shape[1]), seed=123 + fold)
-        X_tr_core_raw = X[tr][mask_core][:, topk_idx]
-        X_val_raw     = X[tr][mask_val][:, topk_idx]
-        X_te_raw      = X[te][:, topk_idx]
+        # Fit the pipeline on the core training data (excluding the inner validation set)
+        pipe.fit(X[tr][mask_core], y[tr][mask_core])
 
-        # Impute
-        imputer.fit(X_tr_core_raw)
-        X_tr_core = imputer.transform(X_tr_core_raw)
-        X_val     = imputer.transform(X_val_raw)
-        X_te      = imputer.transform(X_te_raw)
+        # Tune the decision threshold on the inner validation set
+        p_val = pipe.predict_proba(X[tr][mask_val])[:, 1]
 
-        y_tr_core = y[tr][mask_core]
-        y_val     = y[tr][mask_val]
-        y_te_fold = y[te]
+        # Default to 0.5 if the validation set has only one class
+        thr = tune_thr_balacc(y[tr][mask_val], p_val) if len(
+            np.unique(y[tr][mask_val])) > 1 else 0.5
 
-        pos = int((y_tr_core == 1).sum()); neg = int((y_tr_core == 0).sum())
-        spw = (neg / max(pos, 1)) if pos > 0 else 1.0
+        # Evaluate on the final test set (the held-out participant)
+        p = pipe.predict_proba(X[te])[:, 1]
+        yhat = (p >= thr).astype(int)
 
-        # Per-fold param search (choose by best validation AUPRC)
-        best_model, best_auprc = None, -np.inf
-        for params in param_candidates:
-            model = XGBClassifier(
-                objective='binary:logistic',
-                eval_metric='aucpr',
-                early_stopping_rounds=30,
-                scale_pos_weight=spw,
-                tree_method='hist',
-                max_bin=256,
-                n_jobs=1,
-                random_state=random_state,
-                verbosity=0,
-                **params
-            )
-            model.fit(X_tr_core, y_tr_core, eval_set=[(X_val, y_val)], verbose=False)
-            p_val = model.predict_proba(X_val)[:, 1]
-            auprc = average_precision_score(y_val, p_val)
-            if auprc > best_auprc:
-                best_auprc = auprc
-                best_model = model
-
-        # Threshold tuning on validation (BalancedAcc)
-        p_val = best_model.predict_proba(X_val)[:, 1]
-        thr = tune_thr_balacc(y_val, p_val) if len(np.unique(y_val)) > 1 else 0.5
-
-        # Test
-        p_te = best_model.predict_proba(X_te)[:, 1]
-        yhat = (p_te >= thr).astype(int)
-
-        probs_te.extend(p_te.tolist())
-        y_te.extend(y_te_fold.tolist())
+        # Append results for this fold
+        probs_te.extend(p.tolist())
+        y_te.extend(y[te].tolist())
         yhat_te.extend(yhat.tolist())
         parts_te.extend(groups[te].tolist()) # <-- STORE PARTICIPANT ID
 
-        # Importances in reduced feature space
-        imp = get_safe_feature_importances(best_model, len(topk_idx))
-        imp_df = pd.DataFrame({"feature": [feat_names[i] for i in topk_idx], "importance": imp})
-        fold_imp_dfs.append(imp_df)
-
         if pbar:
-            pbar.set_postfix_str(f"fold={fold}, best_iter={best_model.best_iteration}, thr={thr:.2f}, valAUPRC={best_auprc:.3f}")
+            pbar.set_postfix_str(f"thr={thr:.2f}")
             pbar.update(1)
 
     if pbar:
         pbar.close()
 
+    probs = np.array(probs_te)
+    y_true = np.array(y_te)
+    y_pred = np.array(yhat_te)
+
+    # Print summary metrics directly
+    print("\nRF LOPO (combined):")
+    print("AUROC:", f"{roc_auc_score(y_true, probs):.3f}",
+          "AUPRC:", f"{average_precision_score(y_true, probs):.3f}",
+          "BalancedAcc:", f"{balanced_accuracy_score(y_true, y_pred):.3f}")
+
+    return probs, y_true, y_pred, np.array(parts_te) # <-- RETURN parts_te
+
+
+def run_lopo_rf_slow_tuned(wide_df, labels_ser):
+    # Build slow-only matrix
+    feature_cols = [c for c in wide_df.columns if c not in (
+        'participant', 'label')]
+    slow_cols = [c for c in feature_cols if c.endswith('_slow')]
+    X = wide_df[slow_cols].values
+    y = wide_df['label'].values
+    groups = wide_df['participant'].values
+
+    logo = LeaveOneGroupOut()
+    base = Pipeline([
+        ('impute', SimpleImputer(strategy='median')),
+        ('scale', StandardScaler(with_mean=False)),
+        ('select', SelectKBest(f_classif, k=min(40, len(slow_cols)))),
+        ('clf', RandomForestClassifier(
+            n_estimators=500, max_features='sqrt',
+            min_samples_leaf=3, class_weight='balanced_subsample',
+            random_state=42, n_jobs=1))
+    ])
+
+    probs_te, y_te, yhat_te, parts_te = [], [], [], []
+    for tr, te in logo.split(X, y, groups):
+        # inner validation split per outer fold
+        grp_tr = groups[tr]
+        train_parts = np.unique(grp_tr).tolist()
+        rng = np.random.default_rng(42 + len(train_parts))
+        val_count = max(1, int(0.2 * len(train_parts)))
+        val_parts = rng.choice(
+            train_parts, size=val_count, replace=False).tolist()
+        mask_val = np.isin(grp_tr, val_parts)
+        mask_core = ~mask_val
+
+        # fit on core
+        base.fit(X[tr][mask_core], y[tr][mask_core])
+        # threshold tuning on val (BalancedAcc)
+        p_val = base.predict_proba(X[tr][mask_val])[:, 1]
+        thr_grid = np.linspace(0.1, 0.9, 33)
+        best_thr, best_bal = 0.5, -1.0
+        for t in thr_grid:
+            bal = balanced_accuracy_score(
+                y[tr][mask_val], (p_val >= t).astype(int))
+            if bal > best_bal:
+                best_bal, best_thr = bal, t
+
+        # test
+        p = base.predict_proba(X[te])[:, 1]
+        yhat = (p >= best_thr).astype(int)
+        probs_te.extend(p.tolist())
+        y_te.extend(y[te].tolist())
+        yhat_te.extend(yhat.tolist())
+        parts_te.extend(groups[te].tolist())
+
     probs_te = np.array(probs_te)
     y_te = np.array(y_te)
     yhat_te = np.array(yhat_te)
-    print("\nXGB Top-20 (slow) LOPO:",
-          "AUROC:", f"{roc_auc_score(y_te, probs_te):.3f}",
+    print("\nSlow-only RF (tuned):")
+    print("AUROC:", f"{roc_auc_score(y_te, probs_te):.3f}",
           "AUPRC:", f"{average_precision_score(y_te, probs_te):.3f}",
           "BalancedAcc:", f"{balanced_accuracy_score(y_te, yhat_te):.3f}",
-          "Precision:", f"{precision_score(y_te, yhat_te):.3f}",
-          "Recall:", f"{recall_score(y_te, yhat_te):.3f}",
           "MacroF1:", f"{f1_score(y_te, yhat_te, average='macro'):.3f}")
+    return np.array(parts_te), probs_te, y_te, yhat_te
 
-    # Aggregate importances
-    full_imp = pd.concat(fold_imp_dfs) if fold_imp_dfs else pd.DataFrame(columns=["feature","importance"])
-    mean_imp = (full_imp.groupby("feature")["importance"].mean()
-                .sort_values(ascending=False).reset_index())
-    mean_imp.to_csv("xgb_top20_slow_feature_importance_mean.csv", index=False)
-    mean_imp.head(20).to_csv("xgb_top20_slow_top_features.csv", index=False)
 
-    # <-- RETURN all results for metrics_dict
-    return probs_te, y_te, yhat_te, np.array(parts_te), mean_imp
+def run_speed(X_speed, speed_feature_names, name, y, groups):
+    rng = np.random.default_rng(42)
+    logo = LeaveOneGroupOut()
+    imputer = SimpleImputer(strategy='median')
+    probs_s, y_s, yhat_s, parts_s = [], [], [], [] # <-- ADDED parts_s
+    fold_imp_dfs = []
+    pbar_s = tqdm(total=len(np.unique(groups)),
+                  desc=f"XGB {name}", leave=False)
+    for fold, (tr, te) in enumerate(logo.split(X_speed, y, groups), 1):
+        train_parts = np.unique(groups[tr]).tolist()
+        val_count = max(1, int(0.2 * len(train_parts)))
+        val_parts = rng.choice(
+            train_parts, size=val_count, replace=False).tolist()
+        core_train_parts = [p for p in train_parts if p not in val_parts]
+        mask_tr = np.isin(groups[tr], core_train_parts)
+        mask_val = np.isin(groups[tr], val_parts)
+        X_tr_raw, y_tr_raw = X_speed[tr][mask_tr], y[tr][mask_tr]
+        X_val_raw, y_val_raw = X_speed[tr][mask_val], y[tr][mask_val]
+        X_te_raw, y_te_raw = X_speed[te], y[te]
+        imputer.fit(X_tr_raw)
+        X_tr = imputer.transform(X_tr_raw)
+        X_val = imputer.transform(X_val_raw)
+        X_te = imputer.transform(X_te_raw)
+        pos = int((y_tr_raw == 1).sum())
+        neg = int((y_tr_raw == 0).sum())
+        scale_pos_weight = (neg / max(pos, 1)) if pos > 0 else 1.0
+        model = XGBClassifier(n_estimators=400, max_depth=3, learning_rate=0.05,  early_stopping_rounds=30, subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+                              reg_alpha=0.0, min_child_weight=1, objective='binary:logistic', eval_metric='auc', scale_pos_weight=scale_pos_weight, n_jobs=1, random_state=42, verbosity=0)
+        model.fit(X_tr, y_tr_raw, eval_set=[(X_val, y_val_raw)], verbose=False)
+        p = model.predict_proba(X_te)[:, 1]
+        probs_s.extend(p.tolist())
+        y_s.extend(y_te_raw.tolist())
+        yhat_s.extend((p >= 0.5).astype(int).tolist())
+        parts_s.extend(groups[te].tolist()) # <-- STORE PARTICIPANT ID
+
+        # Use the safe function to get importances for the speed-specific model
+        imp = get_safe_feature_importances(model, len(speed_feature_names))
+        imp_df_fold = pd.DataFrame(
+            {"feature": speed_feature_names, "importance": imp})
+        fold_imp_dfs.append(imp_df_fold)
+        pbar_s.update(1)
+    pbar_s.close()
+
+    print(f"\n{name}:")
+    print("AUROC:", f"{roc_auc_score(y_s, probs_s):.3f}", "AUPRC:", f"{average_precision_score(y_s, probs_s):.3f}", "BalancedAcc:",
+          f"{balanced_accuracy_score(y_s, np.array(yhat_s)):.3f}", "MacroF1:", f"{f1_score(y_s, np.array(yhat_s), average='macro'):.3f}")
+
+    if fold_imp_dfs:
+        full_imp_df = pd.concat(fold_imp_dfs)
+        mean_imp_df = full_imp_df.groupby("feature")["importance"].mean(
+        ).sort_values(ascending=False).reset_index()
+        print(f"\nTop 10 features for {name}:")
+        print(mean_imp_df.head(10).to_string(index=False))
+    
+    # <-- RETURN parts_s -->
+    return np.array(probs_s), np.array(y_s), np.array(yhat_s), np.array(parts_s), mean_imp_df
+
