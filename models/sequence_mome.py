@@ -64,3 +64,78 @@ def build_segment_index(feat_names):
     fast_idx = feat_names.index("is_fast")
     return seg_idx, all_kind, fast_idx
 
+class BagDatasetMoME(Dataset):
+    def __init__(self, data_dir, participants, feat_names, augment=False):
+        X, y, idx, _ = load_seq_artifacts(data_dir)
+        mask = idx["participant"].isin(participants).to_numpy()
+        self.X = X[mask]
+        self.y_cycle = y[mask]
+        self.idx = idx.loc[mask].reset_index(drop=True)
+        self.participants = participants
+        self.feat_names = feat_names
+        self.augment = augment  # <-- store flag
+
+        # per-participant labels
+        self.labels_part = self.idx[["participant"]].assign(y=self.y_cycle).groupby("participant")["y"].first().to_dict()
+        # speed labels per cycle
+        self.speed_targets = (self.X[:,0,feat_names.index("is_fast")] > 0.5).astype(np.float32)
+
+    def __len__(self):
+        return len(self.participants)
+
+    def __getitem__(self, k):
+        pid = self.participants[k]
+        m = (self.idx["participant"] == pid).to_numpy()
+        x_bag = self.X[m].copy()  # (Nc, T, F)
+
+        # Apply augmentations only for training bags
+        if self.augment:
+            for i in range(x_bag.shape[0]):
+                x_bag[i] = apply_augmentations(x_bag[i], self.feat_names)
+
+        x_bag = torch.tensor(x_bag, dtype=torch.float32)
+        y_stress = torch.tensor(self.labels_part[pid], dtype=torch.float32)
+        spd = torch.tensor(self.speed_targets[m], dtype=torch.float32)  # (Nc,)
+        return x_bag, y_stress, torch.tensor(k, dtype=torch.long), spd, pid
+
+class TCNBlock(nn.Module):
+    def __init__(self, in_ch, hidden=32, k=5, d=1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_ch, hidden, kernel_size=k, padding=d*(k-1)//2, dilation=d)
+        self.bn1   = nn.BatchNorm1d(hidden)
+        self.conv2 = nn.Conv1d(hidden, hidden, kernel_size=k, padding=d*(k-1)//2, dilation=d)
+        self.bn2   = nn.BatchNorm1d(hidden)
+    def forward(self, x):  # (B, C, T)
+        h = Fnn.relu(self.bn1(self.conv1(x)))
+        h = Fnn.relu(self.bn2(self.conv2(h)))
+        return h
+
+class SegmentExpertStream(nn.Module):
+    def __init__(self, seg_channels, hidden=32, out_dim=64):
+        super().__init__()
+        self.seg_channels = seg_channels
+        self.segments = list(seg_channels.keys())
+        self.blocks = nn.ModuleDict({
+            seg: TCNBlock(in_ch=len(seg_channels[seg]), hidden=hidden, k=5, d=1)
+            for seg in self.segments
+        })
+        self.proj = nn.Linear(hidden, out_dim)
+        self.gate = nn.Linear(out_dim, len(self.segments))
+
+    def forward(self, x):  # x: (B, T, F_total)
+        B, T, C = x.shape  # renamed from ... , F = x.shape
+        seg_embs = []
+        for seg in self.segments:
+            idxs = self.seg_channels[seg]
+            if len(idxs) == 0:
+                seg_embs.append(torch.zeros(B, self.proj.out_features, device=x.device))
+                continue
+            xs = x[:, :, idxs].transpose(1, 2)    # (B, Cseg, T)
+            h = self.blocks[seg](xs)              # (B, hidden, T)
+            z = h.mean(dim=2)                     # (B, hidden)
+            z = Fnn.relu(self.proj(z))            # use Fnn
+            seg_embs.append(z)
+        H = torch.stack(seg_embs, dim=1)         # (B, S, D)
+        w = torch.softmax(self.gate(H.mean(dim=1)), dim=1)
+        z_kind = torch.sum(H * w.unsqueeze(-1), dim=1)  # (B, D)
+        return z_kind, w
