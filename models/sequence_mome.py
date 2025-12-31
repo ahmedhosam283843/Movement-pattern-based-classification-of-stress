@@ -46,3 +46,21 @@ def indices_for_kind_segment(feat_names, kind, segment_joints):
             idxs.append(feat_names.index(name))
     return idxs
 
+def build_segment_index(feat_names):
+    """
+    Returns:
+      seg_idx: dict(kind -> dict(segment -> list_of_channel_indices))
+      all_kind_indices: dict(kind -> list_of_all_indices_for_that_kind)
+      fast_idx: int index for is_fast channel
+    """
+    seg_idx = {"angle":{}, "vel":{}, "acc":{}}
+    all_kind = {"angle":[], "vel":[], "acc":[]}
+    for kind in ["angle","vel","acc"]:
+        for seg, joints in SEGMENTS.items():
+            idxs = indices_for_kind_segment(feat_names, kind, joints)
+            seg_idx[kind][seg] = idxs
+            all_kind[kind].extend(idxs)
+
+    fast_idx = feat_names.index("is_fast")
+    return seg_idx, all_kind, fast_idx
+
