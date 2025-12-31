@@ -139,3 +139,56 @@ class SegmentExpertStream(nn.Module):
         w = torch.softmax(self.gate(H.mean(dim=1)), dim=1)
         z_kind = torch.sum(H * w.unsqueeze(-1), dim=1)  # (B, D)
         return z_kind, w
+
+class MultiStreamEncoderMoME(nn.Module):
+    """
+    Builds three segment streams (angle/vel/acc), then concatenates their embeddings.
+    """
+    def __init__(self, seg_idx):
+        super().__init__()
+        self.angle_stream = SegmentExpertStream(seg_idx["angle"], hidden=32, out_dim=64)
+        self.vel_stream   = SegmentExpertStream(seg_idx["vel"],   hidden=32, out_dim=64)
+        self.acc_stream   = SegmentExpertStream(seg_idx["acc"],   hidden=32, out_dim=64)
+        self.out_dim = 64 * 3
+
+    def forward(self, x):   # (B, T, F)
+        za, wa = self.angle_stream(x)
+        zv, wv = self.vel_stream(x)
+        zc, wc = self.acc_stream(x)
+        z = torch.cat([za, zv, zc], dim=1)  # (B, D=192)
+        return z
+
+class MILAttention(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.fc = nn.Linear(in_dim, 1)
+    def forward(self, cycle_embs):  # (Nc, D)
+        alpha = torch.softmax(self.fc(cycle_embs).squeeze(-1), dim=0)   # (Nc,)
+        z = torch.sum(cycle_embs * alpha.unsqueeze(-1), dim=0)          # (D,)
+        return z, alpha
+
+class StressSeqMoME(nn.Module):
+    def __init__(self, seg_idx):
+        super().__init__()
+        self.encoder = MultiStreamEncoderMoME(seg_idx)
+        self.mil     = MILAttention(self.encoder.out_dim)
+        self.head_stress = nn.Linear(self.encoder.out_dim, 1)    # bag-level stress
+        self.head_speed  = nn.Linear(self.encoder.out_dim, 1)    # cycle-level speed
+        self.head_id     = None
+
+    def set_id_classes(self, n_ids):
+        self.head_id = nn.Linear(self.encoder.out_dim, n_ids)
+        # ensure head_id is on the same device as the rest of the model
+        self.head_id.to(next(self.parameters()).device)
+
+    def forward(self, x_bag):  # x_bag: (Nc, T, F)
+        # encode each cycle
+        H = self.encoder(x_bag)               # (Nc, D)
+        # MIL pooling
+        z_bag, _ = self.mil(H)                # (D,)
+        # heads
+        logit_stress = self.head_stress(z_bag).view(())       # scalar
+        logits_id    = self.head_id(z_bag)                    # (n_ids,)
+        logits_speed = self.head_speed(H).squeeze(-1)         # (Nc,) cycle-level
+        return logit_stress, logits_speed, logits_id
+
