@@ -81,3 +81,29 @@ def bootstrap_metric(parts, y_true, y_scores, metric_func, n_boot=2000, seed=42,
     return point_estimate, (ci_low, ci_high)
 
 
+def effect_test_part(feature_col, part_df, labels):
+    """
+    Mann-Whitney U at participant level using participant_features.csv.
+    part_df: participant × speed aggregates (columns have suffixes like _mean/_std)
+    labels: Series mapping participant -> 0/1 (control/stressed)
+    Returns (delta_median, p_value, (median_stressed, median_control))
+    """
+    # Collapse slow/fast by mean if both exist, else take available
+    cols = [c for c in part_df.columns if c.startswith(feature_col)]
+    if not cols:
+        return np.nan, np.nan, (np.nan, np.nan)
+    # Example: prefer "_mean_fast" and "_mean_slow", else fall back to any "_mean"
+    mean_cols = [c for c in cols if c.endswith("_mean")]
+    # Collapse per participant across speed by mean of available means
+    df = part_df[['participant'] + mean_cols].copy()
+    df['feat_mean'] = df[mean_cols].mean(axis=1)
+    df = df[['participant','feat_mean']].dropna()
+    df = df.merge(labels.rename('y').reset_index(), on='participant', how='left')
+
+    a = df.loc[df['y']==1, 'feat_mean'].dropna()
+    b = df.loc[df['y']==0, 'feat_mean'].dropna()
+    if len(a) < 8 or len(b) < 8:
+        return np.nan, np.nan, (np.nan, np.nan)
+    stat, p = mannwhitneyu(a, b, alternative='two-sided')
+    eff = float(np.median(a) - np.median(b))
+    return eff, p, (float(np.median(a)), float(np.median(b)))
