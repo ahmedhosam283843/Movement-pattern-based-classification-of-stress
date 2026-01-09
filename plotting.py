@@ -87,3 +87,115 @@ def plot_roc_curve(y_true, y_pred_proba, save_path="roc_curve.pdf", title="ROC C
     plt.savefig(save_path,  dpi=300, bbox_inches='tight')
     print(f"ROC curve saved to {save_path}")
     plt.close()
+
+def plot_pr_curve(y_true, y_pred_proba, save_path="pr_curve.pdf", title="Precision-Recall Curve"):
+    """
+    Plots and saves the Precision-Recall curve.
+    """
+    avg_precision = average_precision_score(y_true, y_pred_proba)
+    random_baseline = np.mean(y_true)
+    precision, recall, _ = precision_recall_curve(y_true, y_pred_proba)
+
+    plt.figure(figsize=(6, 5))
+    plt.plot(recall, precision, color='blue', lw=2,
+             label=f'Model (AUPRC = {avg_precision:.3f})')
+    plt.plot([0, 1], [random_baseline, random_baseline], color='gray', lw=2,
+             linestyle='--', label=f'Random Baseline (AUPRC = {random_baseline:.3f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title(title)
+    plt.legend(loc="upper right")
+    plt.grid(True)
+    plt.gca().spines['top'].set_visible(False)
+    plt.gca().spines['right'].set_visible(False)
+    plt.tight_layout()
+
+    # Use bbox_inches='tight'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Precision-Recall curve saved to {save_path}")
+    plt.close()
+    
+def plot_confusion_matrix(y_true, y_pred, save_path="confusion_matrix.pdf", title="Confusion Matrix", class_names=['Non-Responder', 'Responder']):
+    """
+    Plots and saves a normalized confusion matrix heatmap.
+    """
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # Calculate percentages (normalized by true label)
+    # Add a small epsilon to avoid division by zero if a class has 0 samples
+    cm_sum = cm.sum(axis=1)[:, np.newaxis]
+    cm_norm = cm.astype('float') / (cm_sum + 1e-9)
+    
+    # Create labels with raw counts and normalized percentages
+    labels = np.empty_like(cm, dtype=object)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            labels[i, j] = f"{cm[i, j]}\n({cm_norm[i, j]:.1%})"
+
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm_norm, annot=labels, fmt="", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names,
+                cbar=False, vmin=0, vmax=1)
+    
+    plt.title(title)
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Confusion matrix saved to {save_path}")
+    plt.close()
+
+
+def plot_mean_feature_importance(
+    importance_df,
+    title="Mean Feature Importance (Top 20)",
+    save_path="feature_importance.png"
+):
+    """
+    Plots and saves the mean feature importances from a DataFrame.
+    Assumes importance_df has columns ['feature', 'importance']
+    and is already sorted descending (most important is at index 0).
+    """
+    if not isinstance(importance_df, pd.DataFrame) or importance_df.empty:
+        print("Importance DataFrame is empty or invalid. Skipping plot.")
+        return
+
+    # Sort descending just in case it's not already
+    df_sorted = importance_df.sort_values(by='importance', ascending=False)
+
+    # Take top 20 and apply pretty labels
+    df_top20 = df_sorted.head(20).copy()
+    df_top20['feature_pretty'] = df_top20['feature'].apply(_prettify_label)
+
+    if df_top20.empty:
+        print("No features to plot.")
+        return
+        
+    # --- CORRECTED PLOTTING ---
+    # Make figure wider (10) and taller (8) to fit names
+    plt.figure(figsize=(10, 8)) 
+    plt.title(title)
+    
+    # `plt.barh` plots from bottom to top (index 0 is at the bottom).
+    # To get the most important feature at the TOP, we must reverse the list.
+    plt.barh(
+        df_top20['feature_pretty'][::-1], # Reverse list
+        df_top20['importance'][::-1],     # Reverse list
+        color='C0'
+    )
+    
+    plt.xlabel('Mean Feature Importance (Gini or Gain)')
+    plt.ylabel('Feature')
+    plt.grid(True, axis='x') # Gridlines on x-axis only
+    plt.gca().spines['top'].set_visible(False)
+    plt.gca().spines['right'].set_visible(False)
+    
+    plt.tight_layout() # Adjust layout
+    
+    # Save with bbox_inches='tight' to ensure labels are not cut off
+    plt.savefig(save_path,  dpi=300, bbox_inches='tight')
+    print(f"Feature importance plot saved to {save_path}")
+    plt.close()
+
+
