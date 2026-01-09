@@ -199,3 +199,106 @@ def plot_mean_feature_importance(
     plt.close()
 
 
+
+def plot_correlation_bouts(part_feats_df, labels_ser, log_dir=".", top_k=40):
+    """
+    Calculates avg (Pearson, Spearman, Kendall) correlation of features
+    with the cortisol label, split by slow and fast bouts, and writes the
+    top_k results to CSV and a human-readable TXT file instead of making plots.
+
+    Args:
+        part_feats_df (pd.DataFrame): The long-form participant features
+                                      (from participant_features.csv).
+        labels_ser (pd.Series): A Series mapping participant ID to cortisol label.
+        log_dir (str): Directory to save the output files.
+        top_k (int): How many features to include per speed.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    print("Calculating feature correlations with cortisol label...")
+
+    # 1. Prepare DataFrame
+    df = part_feats_df.merge(
+        labels_ser.rename("cortisol").reset_index(),
+        on="participant",
+        how="left"
+    )
+
+    # 2. Split by speed
+    slow_df = df[df['speed'] == 'slow'].drop(columns=['speed'], errors='ignore')
+    fast_df = df[df['speed'] == 'fast'].drop(columns=['speed'], errors='ignore')
+
+    def _calculate_corrs(speed_df, target_col='cortisol'):
+        """Return a DataFrame indexed by feature with pearson/spearman/kendall/avg."""
+        if target_col not in speed_df.columns:
+            return pd.DataFrame(columns=['pearson', 'spearman', 'kendall', 'avg'])
+
+        corr_df = speed_df.copy()
+        numeric_cols = corr_df.select_dtypes(include=np.number).columns.drop([target_col], errors='ignore')
+
+        if not numeric_cols.empty:
+            medians = corr_df[numeric_cols].median()
+            corr_df[numeric_cols] = corr_df[numeric_cols].fillna(medians)
+
+        # If after imputation there are insufficient samples, correlations may be all NaN
+        try:
+            c_pear = corr_df.corr(method='pearson', numeric_only=True).get(target_col)
+            c_spear = corr_df.corr(method='spearman', numeric_only=True).get(target_col)
+            c_kend = corr_df.corr(method='kendall', numeric_only=True).get(target_col)
+        except Exception:
+            # Return empty DataFrame on unexpected failure
+            return pd.DataFrame(columns=['pearson', 'spearman', 'kendall', 'avg'])
+
+        # Drop the target row/column
+        if c_pear is None:
+            return pd.DataFrame(columns=['pearson', 'spearman', 'kendall', 'avg'])
+
+        df_out = pd.DataFrame({
+            'pearson': c_pear.drop(labels=[target_col], errors='ignore'),
+            'spearman': c_spear.drop(labels=[target_col], errors='ignore'),
+            'kendall': c_kend.drop(labels=[target_col], errors='ignore'),
+        })
+        df_out['avg'] = df_out[['pearson', 'spearman', 'kendall']].mean(axis=1, skipna=True)
+        return df_out
+
+    corr_slow_df = _calculate_corrs(slow_df)
+    corr_fast_df = _calculate_corrs(fast_df)
+
+    def _top_k_with_labels(corr_df, speed_name):
+        if corr_df.empty:
+            return pd.DataFrame(columns=['speed', 'feature', 'feature_pretty', 'pearson', 'spearman', 'kendall', 'avg'])
+        corr_df = corr_df.dropna(how='all')  # drop rows where all correlations are NaN
+        corr_df = corr_df.assign(feature=corr_df.index)
+        corr_df['abs_avg'] = corr_df['avg'].abs()
+        top = corr_df.sort_values(by='abs_avg', ascending=False).head(top_k).drop(columns=['abs_avg'])
+        top['feature_pretty'] = top['feature'].apply(_prettify_label)
+        top = top.reset_index(drop=True)
+        top.insert(0, 'speed', speed_name)
+        # Reorder columns
+        cols = ['speed', 'feature', 'feature_pretty', 'pearson', 'spearman', 'kendall', 'avg']
+        return top[cols]
+
+    top_slow = _top_k_with_labels(corr_slow_df, 'slow')
+    top_fast = _top_k_with_labels(corr_fast_df, 'fast')
+
+    # Combine and write CSV
+    result_df = pd.concat([top_slow, top_fast], ignore_index=True)
+    csv_path = os.path.join(log_dir, "feature_correlations_by_speed.csv")
+    result_df.to_csv(csv_path, index=False)
+    print(f"Feature correlations (CSV) saved to {csv_path}")
+
+    # Also write a human-readable text report
+    txt_path = os.path.join(log_dir, "feature_correlations_by_speed.txt")
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        for speed_name, group in result_df.groupby('speed'):
+            f.write(f"=== Top {top_k} features for speed = {speed_name} ===\n\n")
+            if group.empty:
+                f.write("No valid correlation data.\n\n")
+                continue
+            for _, row in group.iterrows():
+                f.write(f"{row['feature_pretty']} ({row['feature']}):\n")
+                f.write(f"  Pearson:  {row['pearson']:.4f}\n" if pd.notna(row['pearson']) else "  Pearson:  NaN\n")
+                f.write(f"  Spearman: {row['spearman']:.4f}\n" if pd.notna(row['spearman']) else "  Spearman: NaN\n")
+                f.write(f"  Kendall:  {row['kendall']:.4f}\n" if pd.notna(row['kendall']) else "  Kendall: NaN\n")
+                f.write(f"  Avg:      {row['avg']:.4f}\n\n" if pd.notna(row['avg']) else "  Avg:      NaN\n\n")
+        f.write("End of report.\n")
+    print(f"Feature correlations (text) saved to {txt_path}")
