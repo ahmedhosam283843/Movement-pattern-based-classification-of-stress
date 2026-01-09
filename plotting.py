@@ -60,3 +60,30 @@ def _prettify_label(label):
     return label.strip().title()
 
 
+def plot_roc_curve(y_true, y_pred_proba, save_path="roc_curve.pdf", title="ROC Curve"):
+    """
+    Plots and saves the ROC curve.
+    """
+    fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure(figsize=(6, 5))
+    plt.plot(fpr, tpr, color='blue', lw=2,
+             label=f'Model (AUROC = {roc_auc:.3f})')
+    plt.plot([0, 1], [0, 1], color='gray', lw=2, linestyle='--',
+             label='Random Chance (AUROC = 0.500)')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(title)
+    plt.legend(loc="lower right")
+    plt.grid(True)
+    plt.gca().spines['top'].set_visible(False)
+    plt.gca().spines['right'].set_visible(False)
+    plt.tight_layout()
+    
+    # Use bbox_inches='tight' to prevent labels from being cut off
+    plt.savefig(save_path,  dpi=300, bbox_inches='tight')
+    print(f"ROC curve saved to {save_path}")
+    plt.close()
