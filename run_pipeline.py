@@ -91,4 +91,35 @@ def metrics_dict(name, y_true, y_pred, probs, parts):
     return metrics
 
 
+def save_summary(log_dir, rows):
+    """
+    Saves summary metrics to CSV and JSON files with a timestamp.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(log_dir, f"summary_metrics_{ts}.csv")
+    json_path = os.path.join(log_dir, f"summary_metrics_{ts}.json")
+    
+    df = pd.DataFrame(rows)
+    
+    # Reorder columns for clarity
+    cols_order = [
+        "model", "AUROC", "AUROC_CI_low", "AUROC_CI_high",
+        "AUPRC", "AUPRC_CI_low", "AUPRC_CI_high",
+        "BalancedAcc", "BalAcc_CI_low", "BalAcc_CI_high",
+        "Sensitivity (Recall)", "Specificity", "Precision", "MacroF1"
+    ]
+    # Add any extra columns that might exist, just in case
+    other_cols = [c for c in df.columns if c not in cols_order]
+    df = df[cols_order + other_cols]
+    
+    df.to_csv(csv_path, index=False, float_format="%.4f")
+    
+    # Save a rounded version for easy reading in JSON
+    df_json = df.round(4)
+    rows_json = df_json.to_dict('records')
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(rows_json, f, indent=2)
+        
+    print(f"\nSaved summary metrics:\n  {csv_path}\n  {json_path}")
 
