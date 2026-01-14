@@ -97,18 +97,7 @@ We engineered ~700 features inspired by biomechanical literature:
 * **Tuning:** Nested cross-validation for hyperparameter tuning and threshold optimization (maximizing Balanced Accuracy).
 * **Metrics:** AUROC, AUPRC, Balanced Accuracy, Sensitivity, Specificity. 95% Confidence Intervals via participant-level bootstrapping.
 
-## 📊 Results Summary
 
-| Model | Subset | AUROC | Balanced Acc |
-| --- | --- | --- | --- |
-| Random Baseline | - | 0.500 | 0.500 |
-| Logistic Regression | Slow Only | 0.725 | 0.704 |
-| **Random Forest** | **Top-20 Slow** | **0.753** | **0.662** |
-| XGBoost | Slow Only | 0.625 | 0.611 |
-| Logistic Regression | Fast Only | 0.355 | 0.324 |
-| Sequence MoME (DL) | All | 0.401 | 0.463 |
-
-> *Note: Models trained on "Fast" walking data performed worse than random guessing, suggesting the stress signal is washed out at higher gait speeds.*
 
 ## 📜 References & Acknowledgments
 
