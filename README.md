@@ -113,6 +113,3 @@ This work is based on the dataset and study design provided by **Fleischmann et 
 > [3] A. Cătrună et al., "MoME: Estimating psychological traits from gait," *CVPR*, 2024.
 
 ---
-
-**Author:** Ahmed Hossam Mohamed Khalil
-**Institution:** Friedrich-Alexander-Universität Erlangen-Nürnberg
